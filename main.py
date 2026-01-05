@@ -10,7 +10,6 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
-# 数据库模型定义
 Base = declarative_base()
 
 
@@ -32,7 +31,6 @@ class DefaultCity(Base):
     longitude = Column(Float)
 
 
-# 路径与数据库初始化
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATABASE_URL = f"sqlite:///{os.path.join(BASE_DIR, 'cities.db')}"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
@@ -42,34 +40,26 @@ Base.metadata.create_all(bind=engine)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """服务器启动时强制重置数据库并加载最新的 cities.csv"""
     db = SessionLocal()
     try:
-        # 强制清空旧数据，确保云端同步最新的 CSV 城市
         db.query(City).delete()
         db.query(DefaultCity).delete()
+        db.commit()
 
         csv_path = os.path.join(BASE_DIR, "cities.csv")
         if os.path.exists(csv_path):
-            with open(csv_path, "r", encoding='utf-8') as f:  # 确保读取中文不乱码
+            with open(csv_path, "r", encoding='utf-8-sig') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    # 将 CSV 数据存入 DefaultCity 表
-                    db.add(DefaultCity(
-                        name=row["city"],
+                    new_city = City(
+                        name=row["city"].strip(),
                         latitude=float(row["latitude"]),
                         longitude=float(row["longitude"])
-                    ))
+                    )
+                    db.add(new_city)
             db.commit()
-
-            # 将默认城市同步到当前显示表
-            defaults = db.query(DefaultCity).all()
-            for d in defaults:
-                db.add(City(name=d.name, latitude=d.latitude, longitude=d.longitude))
-            db.commit()
-            print("Successfully reloaded all cities from CSV!")
     except Exception as e:
-        print(f"Error during init: {e}")
+        print(f"Error: {e}")
     finally:
         db.close()
     yield
@@ -87,7 +77,6 @@ def get_db():
         db.close()
 
 
-# 异步获取天气数据
 async def fetch_weather(session, city_id, lat, lon):
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true"
     try:
@@ -103,7 +92,6 @@ async def fetch_weather(session, city_id, lat, lon):
 @app.get("/")
 async def read_root(request: Request, db: Session = Depends(get_db)):
     cities = db.query(City).all()
-    # 按照温度降序排列，未更新的排在最后
     sorted_cities = sorted(cities, key=lambda x: (x.temperature is None, -(x.temperature or 0)))
     return templates.TemplateResponse("index.html", {"request": request, "cities": sorted_cities})
 
@@ -112,7 +100,6 @@ async def read_root(request: Request, db: Session = Depends(get_db)):
 async def update_weather(db: Session = Depends(get_db)):
     cities = db.query(City).all()
     now = datetime.utcnow()
-    # 15分钟更新限制逻辑
     to_update = [c for c in cities if not c.updated_at or (now - c.updated_at) > timedelta(minutes=15)]
 
     if to_update:
@@ -123,27 +110,26 @@ async def update_weather(db: Session = Depends(get_db)):
                 if temp is not None:
                     db.query(City).filter(City.id == city_id).update({"temperature": temp, "updated_at": now})
             db.commit()
-    return RedirectResponse("/", status_code=303)
+    return RedirectResponse(url="/", status_code=303)
 
 
 @app.post("/cities/reset")
 async def reset_cities(db: Session = Depends(get_db)):
-    """手动重置按钮：重新从默认表同步"""
     db.query(City).delete()
-    defaults = db.query(DefaultCity).all()
-    for d in defaults:
-        db.add(City(name=d.name, latitude=d.latitude, longitude=d.longitude))
+    csv_path = os.path.join(BASE_DIR, "cities.csv")
+    with open(csv_path, "r", encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            db.add(City(name=row["city"].strip(), latitude=float(row["latitude"]), longitude=float(row["longitude"])))
     db.commit()
-    return RedirectResponse("/", status_code=303)
+    return RedirectResponse(url="/", status_code=303)
 
 
 @app.post("/cities/remove/{city_id}")
 async def remove_city(city_id: int, db: Session = Depends(get_db)):
-    city = db.query(City).filter(City.id == city_id).first()
-    if city:
-        db.delete(city)
-        db.commit()
-    return RedirectResponse("/", status_code=303)
+    db.query(City).filter(City.id == city_id).delete()
+    db.commit()
+    return RedirectResponse(url="/", status_code=303)
 
 
 @app.post("/cities/add")
@@ -152,4 +138,4 @@ async def add_city(name: str = Form(...), lat: float = Form(...), lon: float = F
     if not db.query(City).filter(City.name == name).first():
         db.add(City(name=name, latitude=lat, longitude=lon))
         db.commit()
-    return RedirectResponse("/", status_code=303)
+    return RedirectResponse(url="/", status_code=303)
