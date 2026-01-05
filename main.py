@@ -10,7 +10,7 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
-# Models and Database Setup
+# 数据库模型定义
 Base = declarative_base()
 
 
@@ -32,10 +32,9 @@ class DefaultCity(Base):
     longitude = Column(Float)
 
 
-# Dynamic Path Setup
+# 路径与数据库初始化
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATABASE_URL = f"sqlite:///{os.path.join(BASE_DIR, 'cities.db')}"
-
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base.metadata.create_all(bind=engine)
@@ -43,33 +42,40 @@ Base.metadata.create_all(bind=engine)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """服务器启动时强制重置数据库并加载最新的 cities.csv"""
     db = SessionLocal()
     try:
-        if not db.query(DefaultCity).first():
-            csv_path = os.path.join(BASE_DIR, "cities.csv")
-            if os.path.exists(csv_path):
-                with open(csv_path, "r") as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        db.add(DefaultCity(
-                            name=row["city"],
-                            latitude=float(row["latitude"]),
-                            longitude=float(row["longitude"])
-                        ))
-                db.commit()
+        # 强制清空旧数据，确保云端同步最新的 CSV 城市
+        db.query(City).delete()
+        db.query(DefaultCity).delete()
 
-        if not db.query(City).first():
+        csv_path = os.path.join(BASE_DIR, "cities.csv")
+        if os.path.exists(csv_path):
+            with open(csv_path, "r", encoding='utf-8') as f:  # 确保读取中文不乱码
+                reader = csv.DictReader(f)
+                for row in reader:
+                    # 将 CSV 数据存入 DefaultCity 表
+                    db.add(DefaultCity(
+                        name=row["city"],
+                        latitude=float(row["latitude"]),
+                        longitude=float(row["longitude"])
+                    ))
+            db.commit()
+
+            # 将默认城市同步到当前显示表
             defaults = db.query(DefaultCity).all()
             for d in defaults:
                 db.add(City(name=d.name, latitude=d.latitude, longitude=d.longitude))
             db.commit()
+            print("Successfully reloaded all cities from CSV!")
+    except Exception as e:
+        print(f"Error during init: {e}")
     finally:
         db.close()
     yield
 
 
 app = FastAPI(lifespan=lifespan)
-# This line now uses the absolute path to avoid "TemplateNotFound" errors
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 
 
@@ -81,6 +87,7 @@ def get_db():
         db.close()
 
 
+# 异步获取天气数据
 async def fetch_weather(session, city_id, lat, lon):
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true"
     try:
@@ -96,6 +103,7 @@ async def fetch_weather(session, city_id, lat, lon):
 @app.get("/")
 async def read_root(request: Request, db: Session = Depends(get_db)):
     cities = db.query(City).all()
+    # 按照温度降序排列，未更新的排在最后
     sorted_cities = sorted(cities, key=lambda x: (x.temperature is None, -(x.temperature or 0)))
     return templates.TemplateResponse("index.html", {"request": request, "cities": sorted_cities})
 
@@ -104,6 +112,7 @@ async def read_root(request: Request, db: Session = Depends(get_db)):
 async def update_weather(db: Session = Depends(get_db)):
     cities = db.query(City).all()
     now = datetime.utcnow()
+    # 15分钟更新限制逻辑
     to_update = [c for c in cities if not c.updated_at or (now - c.updated_at) > timedelta(minutes=15)]
 
     if to_update:
@@ -119,6 +128,7 @@ async def update_weather(db: Session = Depends(get_db)):
 
 @app.post("/cities/reset")
 async def reset_cities(db: Session = Depends(get_db)):
+    """手动重置按钮：重新从默认表同步"""
     db.query(City).delete()
     defaults = db.query(DefaultCity).all()
     for d in defaults:
